@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual Environment
+attendance_env/
+venv/
+.env/
+
+# Environment Variables
+.env
+
+# Dataset
+dataset/
+
+# Face Encodings
+models/encodings.pkl
+
+# Database files
+*.db
+
+# Streamlit
+.streamlit/
+
+# VS Code
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
