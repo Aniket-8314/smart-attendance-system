@@ -2,7 +2,6 @@
 
 import os
 import sys
-
 import streamlit as st
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -49,7 +48,9 @@ if submit:
             student = Student(**cleaned)
             db.add(student)
             db.commit()
+            st.session_state["selected_roll_no"] = cleaned["roll_no"]
             st.success(f"{cleaned['name']} registered successfully.")
+            st.switch_page("pages/image_capture.py")
         except Exception as exc:
             db.rollback()
             st.error(f"Could not register student: {exc}")

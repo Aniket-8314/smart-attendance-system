@@ -121,3 +121,23 @@ class AttendanceCaptureImage(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     capture = relationship("AttendanceCapture", back_populates="image_data")
+
+class StudentImage(Base):
+    __tablename__ = "student_images"
+
+    id = Column(Integer, primary_key=True)
+
+    student_id = Column(
+        Integer,
+        ForeignKey("students.id"),
+        nullable=False
+    )
+
+    image_path = Column(String, nullable=False)
+
+    uploaded_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now()
+    )
+
+    student = relationship("Student")
