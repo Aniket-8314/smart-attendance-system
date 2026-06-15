@@ -1,11 +1,10 @@
 av==16.1.0
-dlib==20.0.1
 mediapipe==0.10.35
-numpy==2.4.6
-opencv_python==4.13.0.92
-opencv_python_headless==4.10.0.84
+numpy==2.2.6
+opencv-python-headless==4.10.0.84
 python-dotenv==1.2.2
 SQLAlchemy==2.0.51
 streamlit==1.58.0
-streamlit_webrtc==0.72.1
+streamlit-webrtc==0.72.1
 supabase==2.31.0
+psycopg2-binary
