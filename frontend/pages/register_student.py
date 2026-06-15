@@ -25,7 +25,7 @@ with st.form("student_form", clear_on_submit=False):
     left, right = st.columns(2)
     with left:
         name = st.text_input("Student Name", placeholder="Full name", max_chars=120)
-        roll_no = st.text_input("Roll Number", placeholder="Example: 2401ME08", max_chars=60)
+        roll_no = st.text_input("Roll Number", placeholder="Example: 2401ME01", max_chars=60)
     with right:
         department = st.text_input("Department", placeholder="Example: Computer Science", max_chars=120)
         semester = st.selectbox("Semester", ["1", "2", "3", "4", "5", "6", "7", "8"])
