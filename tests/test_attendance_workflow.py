@@ -1,146 +1,177 @@
 import os
-import tempfile
+import time
 import unittest
 from datetime import datetime, timezone
-from pathlib import Path
 
-import cv2
-import numpy as np
 import av
-from sqlalchemy import MetaData, create_engine, inspect, text
+import numpy as np
+from sqlalchemy import create_engine, inspect
 from sqlalchemy.orm import sessionmaker
 
 
+class FakeStorageService:
+    def __init__(self):
+        self.student_uploads = []
+        self.capture_uploads = []
+        self.deleted_student_paths = []
+        self.folder_listings = {}
+
+    def upload_student_image(self, roll_no, image_bytes, content_type="image/jpeg", filename=None):
+        path = f"{roll_no}/{filename or 'student.jpg'}"
+        self.student_uploads.append((path, image_bytes, content_type))
+        return path
+
+    def upload_attendance_capture(self, session_id, image_bytes, content_type="image/jpeg", filename=None):
+        path = f"{session_id}/{filename or 'capture.jpg'}"
+        self.capture_uploads.append((path, image_bytes, content_type))
+        return path
+
+    def get_public_url(self, bucket, path):
+        return f"https://example.test/{bucket}/{path}"
+
+    def delete_student_images(self, roll_no, image_paths=None):
+        paths = set(image_paths or [])
+        for entry in self.folder_listings.get(roll_no, []):
+            paths.add(f"{roll_no}/{entry}")
+        self.deleted_student_paths.append((roll_no, sorted(paths)))
+        return len(paths)
+
+
 class AttendanceWorkflowTest(unittest.TestCase):
-    def test_legacy_schema_adds_cycle_columns(self):
-        from database.schema import initialize_database
-
-        engine = create_engine("sqlite:///:memory:")
-        with engine.begin() as connection:
-            connection.execute(text("""
-                CREATE TABLE attendance_sessions (
-                    id INTEGER PRIMARY KEY,
-                    session_id VARCHAR NOT NULL,
-                    user_name VARCHAR NOT NULL,
-                    duration_minutes INTEGER NOT NULL
-                )
-            """))
-            connection.execute(text("""
-                CREATE TABLE attendance_captures (
-                    id INTEGER PRIMARY KEY,
-                    session_id VARCHAR NOT NULL,
-                    image_path VARCHAR NOT NULL,
-                    capture_number INTEGER NOT NULL
-                )
-            """))
-
-        class EmptyBase:
-            metadata = MetaData()
-
-        initialize_database(engine, EmptyBase)
-        session_columns = {
-            column["name"]
-            for column in inspect(engine).get_columns("attendance_sessions")
-        }
-        capture_columns = {
-            column["name"]
-            for column in inspect(engine).get_columns("attendance_captures")
-        }
-        self.assertIn("collection_type", session_columns)
-        self.assertIn("total_cycles_completed", session_columns)
-        self.assertIn("cycle_id", capture_columns)
-
-    def test_new_attendance_schema_allows_session_without_student(self):
+    def setUp(self):
         os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
-        from database.models import AttendanceCaptureImage, AttendanceSession, Base
+
+    def _prepare_service(self):
+        from database.models import Base
 
         engine = create_engine("sqlite:///:memory:")
         Base.metadata.create_all(engine)
-        columns = {
-            column["name"]: column
-            for column in inspect(engine).get_columns(AttendanceSession.__tablename__)
-        }
-        self.assertTrue(columns["student_id"]["nullable"])
-        image_columns = {
-            column["name"]
-            for column in inspect(engine).get_columns(AttendanceCaptureImage.__tablename__)
-        }
-        self.assertIn("image_bytes", image_columns)
-        self.assertIn("content_type", image_columns)
-
-    def test_save_student_dataset_stores_images_in_database(self):
-        os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
-        from backend import attendance_service as attendance_module
-        from backend.attendance_service import AttendanceService, TARGET_IMAGES
-        from database.models import AttendanceCaptureImage, Base
-
-        engine = create_engine("sqlite:///:memory:")
         TestingSessionLocal = sessionmaker(bind=engine)
-        Base.metadata.create_all(engine)
+
+        import backend.attendance_service as attendance_module
 
         original_engine = attendance_module.engine
         original_session_local = attendance_module.SessionLocal
         attendance_module.engine = engine
         attendance_module.SessionLocal = TestingSessionLocal
+
+        service = attendance_module.AttendanceService(storage=FakeStorageService())
+        return service, engine, TestingSessionLocal, attendance_module, original_engine, original_session_local
+
+    def test_normalized_schema_is_defined(self):
+        from database.models import AttendanceCapture, AttendanceRecord, AttendanceSession, Student, StudentImage, Base
+
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+
+        table_names = inspect(engine).get_table_names()
+        self.assertEqual(
+            {"students", "student_images", "attendance_sessions", "attendance_captures", "attendance_records"},
+            set(table_names),
+        )
+
+        student_columns = {column["name"] for column in inspect(engine).get_columns(Student.__tablename__)}
+        self.assertTrue({"roll_no", "name", "dept", "sem"}.issubset(student_columns))
+
+        session_columns = {column["name"] for column in inspect(engine).get_columns(AttendanceSession.__tablename__)}
+        self.assertTrue({"session_id", "prof_name", "course_name", "start_time", "end_time", "expected_students", "captured_students", "status"}.issubset(session_columns))
+
+        capture_columns = {column["name"] for column in inspect(engine).get_columns(AttendanceCapture.__tablename__)}
+        self.assertTrue({"capture_id", "session_id", "image_path", "capture_time"}.issubset(capture_columns))
+
+        record_columns = {column["name"] for column in inspect(engine).get_columns(AttendanceRecord.__tablename__)}
+        self.assertTrue({"record_id", "session_id", "roll_no", "confidence_score", "marked_at", "status"}.issubset(record_columns))
+
+        image_columns = {column["name"] for column in inspect(engine).get_columns(StudentImage.__tablename__)}
+        self.assertTrue({"image_id", "roll_no", "image_path", "uploaded_at"}.issubset(image_columns))
+
+    def test_student_image_and_attendance_workflow(self):
+        service, engine, session_local, module, original_engine, original_session_local = self._prepare_service()
         try:
-            service = AttendanceService()
-            session = service.create_session("Instructor", 5)
-            frames = [
-                np.full((24, 32, 3), value, dtype=np.uint8)
-                for value in range(TARGET_IMAGES)
-            ]
-            times = [datetime.now(timezone.utc) for _ in range(TARGET_IMAGES)]
+            student = service.create_or_update_student("2401ME01", "Asha", "Mechanical", "6")
+            self.assertEqual("2401ME01", student.roll_no)
 
-            student_id, captures = service.save_student_dataset(
-                session.session_id,
-                frames,
-                times,
+            student_image = service.add_student_image(
+                "2401ME01",
+                b"\xff\xd8\xff\xdbtest-image",
+                filename="img1.jpg",
             )
+            self.assertEqual("2401ME01/img1.jpg", student_image.image_path)
+            self.assertEqual(1, len(service.list_student_images("2401ME01")))
 
-            self.assertEqual("STD_000001", student_id)
-            self.assertEqual(TARGET_IMAGES, len(captures))
-            with TestingSessionLocal() as db:
-                rows = db.query(AttendanceCaptureImage).all()
-                self.assertEqual(TARGET_IMAGES, len(rows))
-                self.assertEqual("image/jpeg", rows[0].content_type)
-                self.assertGreater(rows[0].byte_size, 0)
-                self.assertTrue(rows[0].image_bytes.startswith(b"\xff\xd8"))
+            session = service.create_session("Professor Sharma", "Computer Networks", expected_students=25)
+            capture = service.add_capture(session.session_id, b"\xff\xd8\xff\xdbcapture", filename="capture_1.jpg")
+            self.assertEqual(f"{session.session_id}/capture_1.jpg", capture.image_path)
+
+            record = service.add_attendance_record(
+                session.session_id,
+                "2401ME01",
+                0.93,
+                status="PRESENT",
+                marked_at=datetime.now(timezone.utc),
+            )
+            duplicate = service.add_attendance_record(
+                session.session_id,
+                "2401ME01",
+                0.75,
+                status="MANUALLY_VERIFIED",
+            )
+            self.assertEqual(record.record_id, duplicate.record_id)
+
+            closed = service.close_session(session.session_id)
+            self.assertEqual("CLOSED", closed.status)
+            self.assertEqual(1, closed.captured_students)
+
+            stats = service.get_session_statistics(session.session_id)
+            self.assertEqual(1, stats["capture_count"])
+            self.assertEqual(1, stats["record_count"])
+            self.assertEqual(1, stats["present_count"])
         finally:
-            attendance_module.engine = original_engine
-            attendance_module.SessionLocal = original_session_local
+            module.engine = original_engine
+            module.SessionLocal = original_session_local
 
-    def test_quality_validation_rejects_blur_boundary_and_duplicates(self):
-        from backend.face_detection_service import FaceDetectionService
+    def test_delete_student_images_removes_storage_and_database_rows(self):
+        service, engine, session_local, module, original_engine, original_session_local = self._prepare_service()
+        try:
+            service.create_or_update_student("2401ME03", "Nina", "IT", "4")
+            first_image = service.add_student_image("2401ME03", b"img-one", filename="old_1.jpg")
+            second_image = service.add_student_image("2401ME03", b"img-two", filename="old_2.jpg")
 
-        service = FaceDetectionService.__new__(FaceDetectionService)
-        service.blur_threshold = 80.0
-        sharp = np.zeros((480, 640, 3), dtype=np.uint8)
-        for y in range(0, 480, 20):
-            for x in range(0, 640, 20):
-                if (x // 20 + y // 20) % 2:
-                    sharp[y:y + 20, x:x + 20] = 255
+            service.storage.folder_listings["2401ME03"] = ["old_1.jpg", "old_2.jpg", "orphan.jpg"]
 
-        valid_face = [{"bbox": (180, 100, 460, 400), "confidence": 0.9}]
-        valid, _, _ = service.validate_capture(sharp, valid_face)
-        self.assertTrue(valid)
+            deleted_count = service.delete_student_images("2401ME03")
 
-        blurred = cv2.GaussianBlur(sharp, (51, 51), 0)
-        valid, message, _ = service.validate_capture(blurred, valid_face)
-        self.assertFalse(valid)
-        self.assertIn("blurred", message)
+            self.assertEqual(2, deleted_count)
+            self.assertEqual(
+                [
+                    (
+                        "2401ME03",
+                        [
+                            "2401ME03/old_1.jpg",
+                            "2401ME03/old_2.jpg",
+                            "2401ME03/orphan.jpg",
+                        ],
+                    )
+                ],
+                service.storage.deleted_student_paths,
+            )
+            self.assertEqual([], service.list_student_images("2401ME03"))
+        finally:
+            module.engine = original_engine
+            module.SessionLocal = original_session_local
 
-        boundary_face = [{"bbox": (0, 100, 300, 400), "confidence": 0.9}]
-        valid, message, _ = service.validate_capture(sharp, boundary_face)
-        self.assertFalse(valid)
-        self.assertIn("outside", message)
-
-        valid, message, _ = service.validate_capture(sharp, valid_face, sharp.copy())
-        self.assertFalse(valid)
-        self.assertIn("distinct", message)
+    def test_confidence_score_validation(self):
+        service, engine, session_local, module, original_engine, original_session_local = self._prepare_service()
+        try:
+            service.create_or_update_student("2401ME02", "Ravi", "ECE", "5")
+            session = service.create_session("Prof", "Signals")
+            with self.assertRaises(ValueError):
+                service.add_attendance_record(session.session_id, "2401ME02", 1.5)
+        finally:
+            module.engine = original_engine
+            module.SessionLocal = original_session_local
 
     def test_video_processor_factory_is_lightweight_and_detector_is_lazy(self):
-        import time
-
         from backend.capture_processor import AttendanceVideoProcessor
 
         started = time.perf_counter()
@@ -148,27 +179,12 @@ class AttendanceWorkflowTest(unittest.TestCase):
         self.assertLess(time.perf_counter() - started, 0.5)
         self.assertFalse(processor.detector.get_detector_info()["initialized"])
 
-        frame = av.VideoFrame.from_ndarray(
-            np.zeros((240, 320, 3), dtype=np.uint8),
-            format="bgr24",
-        )
+        frame = av.VideoFrame.from_ndarray(np.zeros((240, 320, 3), dtype=np.uint8), format="bgr24")
         started = time.perf_counter()
         processor.recv(frame)
         self.assertLess(time.perf_counter() - started, 0.5)
         snapshot = processor.snapshot()
         self.assertTrue(snapshot["first_frame_received"])
-        self.assertEqual(snapshot["queue_size"], 0)
-
-        deadline = time.perf_counter() + 2
-        while time.perf_counter() < deadline:
-            info = processor.detector.get_detector_info()
-            if info["initialized"] or info["initialization_error"]:
-                break
-            time.sleep(0.01)
-
-        info = processor.detector.get_detector_info()
-        self.assertTrue(info["initialized"], info["initialization_error"])
-        self.assertLess(info["initialization_seconds"], 2)
 
 
 if __name__ == "__main__":

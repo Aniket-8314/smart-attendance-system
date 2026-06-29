@@ -1,23 +1,19 @@
-"""Database operations for attendance dataset collection sessions."""
+"""Attendance persistence and storage workflows."""
+
+from __future__ import annotations
 
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence
 
 import cv2
 import numpy as np
-from sqlalchemy import func
+from sqlalchemy import distinct, func
 
 from backend.storage_service import StorageService
-from database.db import SessionLocal, engine
-from database.models import (
-    AttendanceCapture,
-    AttendanceCaptureImage,
-    AttendanceSession,
-    Base,
-    Student,
-)
+from database.db import Base, SessionLocal, engine
+from database.models import AttendanceCapture, AttendanceRecord, AttendanceSession, Student, StudentImage
 from database.schema import initialize_database
 
 logger = logging.getLogger(__name__)
@@ -25,12 +21,11 @@ logger = logging.getLogger(__name__)
 TARGET_IMAGES = 20
 
 
-def encode_frame_as_jpeg(frame: np.ndarray) -> Tuple[bytes, int, int]:
+def encode_frame_as_jpeg(frame: np.ndarray) -> bytes:
     success, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
     if not success:
-        raise OSError("Failed to encode attendance image as JPEG")
-    height, width = frame.shape[:2]
-    return encoded.tobytes(), width, height
+        raise OSError("Failed to encode image as JPEG")
+    return encoded.tobytes()
 
 
 class AttendanceService:
@@ -38,272 +33,372 @@ class AttendanceService:
         initialize_database(engine, Base)
         self.storage = storage or StorageService()
 
+    @staticmethod
+    def _ensure_confidence(confidence_score: float) -> None:
+        if confidence_score < 0 or confidence_score > 1:
+            raise ValueError("confidence_score must be between 0 and 1")
+
+    @staticmethod
+    def _ensure_status(status: str, allowed: Iterable[str]) -> None:
+        if status not in allowed:
+            raise ValueError(f"status must be one of {sorted(allowed)}")
+
+    def create_or_update_student(self, roll_no: str, name: str, dept: str, sem: str) -> Student:
+        roll_no = roll_no.strip()
+        name = name.strip()
+        dept = dept.strip()
+        sem = sem.strip()
+        if not roll_no:
+            raise ValueError("roll_no is required")
+        if not name:
+            raise ValueError("name is required")
+        if not dept:
+            raise ValueError("dept is required")
+        if not sem:
+            raise ValueError("sem is required")
+
+        with SessionLocal() as db:
+            student = db.get(Student, roll_no)
+            if student is None:
+                student = Student(roll_no=roll_no, name=name, dept=dept, sem=sem)
+                db.add(student)
+            else:
+                student.name = name
+                student.dept = dept
+                student.sem = sem
+            db.commit()
+            db.refresh(student)
+            return student
+
+    def list_students(self) -> List[Student]:
+        with SessionLocal() as db:
+            return db.query(Student).order_by(Student.roll_no).all()
+
+    def get_student(self, roll_no: str) -> Optional[Student]:
+        with SessionLocal() as db:
+            return db.get(Student, roll_no)
+
+    def add_student_image(
+        self,
+        roll_no: str,
+        image_bytes: bytes,
+        content_type: str = "image/jpeg",
+        filename: Optional[str] = None,
+    ) -> StudentImage:
+        if not image_bytes:
+            raise ValueError("image_bytes cannot be empty")
+        if self.get_student(roll_no) is None:
+            raise ValueError("roll_no must exist before image insertion")
+
+        with SessionLocal() as db:
+            student = db.get(Student, roll_no)
+            if student is None:
+                raise ValueError("roll_no must exist before image insertion")
+            image_path = self.storage.upload_student_image(
+                roll_no=roll_no,
+                image_bytes=image_bytes,
+                content_type=content_type,
+                filename=filename,
+            )
+            student_image = StudentImage(
+                roll_no=roll_no,
+                image_path=image_path,
+            )
+            db.add(student_image)
+            db.commit()
+            db.refresh(student_image)
+            return student_image
+
+    def list_student_images(self, roll_no: Optional[str] = None) -> List[StudentImage]:
+        with SessionLocal() as db:
+            query = db.query(StudentImage).order_by(StudentImage.uploaded_at.desc())
+            if roll_no:
+                query = query.filter(StudentImage.roll_no == roll_no)
+            return query.all()
+
     def create_session(
         self,
-        user_name: str,
-        duration_minutes: int,
-        student_id: Optional[int] = None,
-        collection_type: str = "attendance",
+        prof_name: str,
+        course_name: str,
+        expected_students: Optional[int] = None,
     ) -> AttendanceSession:
-        instructor = user_name.strip()
-        if not instructor:
-            raise ValueError("Instructor name is required")
-        if duration_minutes <= 0:
-            raise ValueError("Session duration must be positive")
+        prof_name = prof_name.strip()
+        course_name = course_name.strip()
+        if not prof_name:
+            raise ValueError("prof_name is required")
+        if not course_name:
+            raise ValueError("course_name is required")
+        if expected_students is not None and expected_students < 0:
+            raise ValueError("expected_students must be non-negative")
 
         with SessionLocal() as db:
             session = AttendanceSession(
                 session_id=str(uuid.uuid4()),
-                student_id=student_id,
-                user_name=instructor,
-                duration_minutes=duration_minutes,
-                status="active",
-                collection_type=collection_type,
+                prof_name=prof_name,
+                course_name=course_name,
+                expected_students=expected_students,
+                captured_students=0,
+                status="ACTIVE",
             )
             db.add(session)
             db.commit()
             db.refresh(session)
-            logger.info("Session Started: %s", session.session_id)
+            logger.info("Session started: %s", session.session_id)
             return session
 
     def get_session(self, session_id: str) -> Optional[AttendanceSession]:
         with SessionLocal() as db:
-            return db.query(AttendanceSession).filter_by(session_id=session_id).first()
+            return db.get(AttendanceSession, session_id)
 
-    def end_session(self, session_id: str, status: str = "completed") -> Optional[AttendanceSession]:
+    def list_sessions(self) -> List[AttendanceSession]:
         with SessionLocal() as db:
-            session = db.query(AttendanceSession).filter_by(session_id=session_id).first()
+            return db.query(AttendanceSession).order_by(AttendanceSession.start_time.desc()).all()
+
+    def close_session(self, session_id: str, captured_students: Optional[int] = None) -> Optional[AttendanceSession]:
+        with SessionLocal() as db:
+            session = db.get(AttendanceSession, session_id)
             if session is None:
                 return None
-            if session.status == "active":
-                session.session_end = datetime.now(timezone.utc)
-                session.status = status
+            if session.status != "CLOSED":
+                session.end_time = datetime.now(timezone.utc)
+                session.status = "CLOSED"
+                
+                # FIXED: Preserve manual loop counter state instead of running automatic SQL database overrides
+                if captured_students is not None:
+                    session.captured_students = captured_students
+                
                 db.commit()
                 db.refresh(session)
-                logger.info("Session Ended: %s (%s)", session_id, status)
             return session
-
-    def generate_student_id(self, session_id: str) -> str:
-        with SessionLocal() as db:
-            session = db.query(AttendanceSession).filter_by(session_id=session_id).first()
-            if session is None:
-                raise ValueError("Attendance session not found")
-            return f"STD_{session.total_cycles_completed + 1:06d}"
-
-    def save_student_dataset(
-        self,
-        session_id: str,
-        frames: Sequence[np.ndarray],
-        capture_times: Sequence[datetime],
-        device_info: str = "Browser webcam",
-    ) -> Tuple[str, List[AttendanceCapture]]:
-        if len(frames) != TARGET_IMAGES or len(capture_times) != TARGET_IMAGES:
-            raise ValueError(f"Exactly {TARGET_IMAGES} images are required before saving")
-
-        student_id = self.generate_student_id(session_id)
-        logger.info("Student Dataset Started: %s", student_id)
-        logger.info("Student ID Generated: %s", student_id)
-
-        encoded_images = [
-            (sequence, *encode_frame_as_jpeg(frame))
-            for sequence, frame in enumerate(frames, start=1)
-        ]
-
-        try:
-            with SessionLocal() as db:
-                session = (
-                    db.query(AttendanceSession)
-                    .filter_by(session_id=session_id, status="active")
-                    .with_for_update()
-                    .first()
-                )
-                if session is None:
-                    raise ValueError("Attendance session is no longer active")
-
-                student = Student(
-                    roll_no=f"{session_id[:8]}-{student_id}",
-                    name=student_id,
-                    department="Attendance Collection",
-                    semester="Session",
-                )
-                db.add(student)
-                db.flush()
-
-                captures = []
-                for (sequence, image_bytes, width, height), captured_at in zip(
-                    encoded_images,
-                    capture_times,
-                ):
-                    filename = f"image_{sequence:03d}.jpg"
-                    image_path = f"db://attendance_capture_images/{session_id}/{student_id}/{filename}"
-                    capture = AttendanceCapture(
-                        session_id=session_id,
-                        cycle_id=student_id,
-                        image_path=image_path,
-                        capture_time=captured_at,
-                        face_count=1,
-                        verification_status="approved",
-                        image_width=width,
-                        image_height=height,
-                        capture_number=sequence,
-                        device_info=device_info,
-                    )
-                    db.add(capture)
-                    db.flush()
-                    db.add(
-                        AttendanceCaptureImage(
-                            capture_id=capture.id,
-                            session_id=session_id,
-                            cycle_id=student_id,
-                            capture_number=sequence,
-                            file_name=filename,
-                            content_type="image/jpeg",
-                            image_bytes=image_bytes,
-                            byte_size=len(image_bytes),
-                        )
-                    )
-                    captures.append(capture)
-
-                session.total_cycles_completed += 1
-                session.total_images_collected += len(captures)
-                db.commit()
-                for capture in captures:
-                    db.refresh(capture)
-                logger.info("Dataset Approved: %s", student_id)
-                logger.info("Dataset Saved: %s (%d images)", student_id, len(captures))
-                return student_id, captures
-        except Exception:
-            logger.exception("Database failure while saving %s", student_id)
-            raise
-
-    def approve_cycle(
-        self,
-        session_id: str,
-        cycle_number: int,
-        frames: Sequence[np.ndarray],
-        capture_times: Sequence[datetime],
-        device_info: str = "Browser webcam",
-    ) -> List[AttendanceCapture]:
-        student_id, captures = self.save_student_dataset(
-            session_id, frames, capture_times, device_info
-        )
-        return captures
-
-    def reject_cycle(self, session_id: str, cycle_number: int) -> None:
-        logger.info("Cycle Rejected: %s/cycle_%03d", session_id, cycle_number)
-
-    def get_session_captures(self, session_id: str) -> List[AttendanceCapture]:
-        with SessionLocal() as db:
-            return (
-                db.query(AttendanceCapture)
-                .filter_by(session_id=session_id)
-                .order_by(AttendanceCapture.cycle_id, AttendanceCapture.capture_number)
-                .all()
-            )
 
     def add_capture(
         self,
         session_id: str,
-        image_path: str,
-        face_count: int,
-        image_width: int,
-        image_height: int,
-        capture_number: int,
-        device_info: Optional[str] = None,
+        image_bytes: bytes,
+        capture_time: Optional[datetime] = None,
+        filename: Optional[str] = None,
+        content_type: str = "image/jpeg",
     ) -> AttendanceCapture:
-        """Compatibility method for existing single-image collection pages."""
+        if not image_bytes:
+            raise ValueError("image_bytes cannot be empty")
+
         with SessionLocal() as db:
+            session = db.get(AttendanceSession, session_id)
+            if session is None:
+                raise ValueError("session_id must exist before capture insertion")
+            image_path = self.storage.upload_attendance_capture(
+                session_id=session_id,
+                image_bytes=image_bytes,
+                content_type=content_type,
+                filename=filename,
+            )
             capture = AttendanceCapture(
                 session_id=session_id,
-                cycle_id="dataset",
                 image_path=image_path,
-                capture_time=datetime.now(timezone.utc),
-                face_count=face_count,
-                verification_status="accepted" if face_count == 1 else "rejected",
-                image_width=image_width,
-                image_height=image_height,
-                capture_number=capture_number,
-                device_info=device_info,
+                capture_time=capture_time or datetime.now(timezone.utc),
             )
             db.add(capture)
             db.commit()
             db.refresh(capture)
             return capture
 
-    def update_session_image_count(self, session_id: str) -> Optional[AttendanceSession]:
+    def list_session_captures(self, session_id: str) -> List[AttendanceCapture]:
         with SessionLocal() as db:
-            session = db.query(AttendanceSession).filter_by(session_id=session_id).first()
+            return (
+                db.query(AttendanceCapture)
+                .filter(AttendanceCapture.session_id == session_id)
+                .order_by(AttendanceCapture.capture_time.desc())
+                .all()
+            )
+
+    def add_attendance_record(
+        self,
+        session_id: str,
+        roll_no: str,
+        confidence_score: float,
+        status: str = "PRESENT",
+        marked_at: Optional[datetime] = None,
+    ) -> AttendanceRecord:
+        self._ensure_confidence(confidence_score)
+        self._ensure_status(status, {"PRESENT", "ABSENT", "MANUALLY_VERIFIED"})
+
+        with SessionLocal() as db:
+            session = db.get(AttendanceSession, session_id)
             if session is None:
-                return None
-            session.total_images_collected = (
-                db.query(func.count(AttendanceCapture.id))
-                .filter_by(session_id=session_id, verification_status="approved")
+                raise ValueError("session_id must exist before attendance record insertion")
+            student = db.get(Student, roll_no)
+            if student is None:
+                raise ValueError("roll_no must exist before attendance record insertion")
+
+            existing = (
+                db.query(AttendanceRecord)
+                .filter(
+                    AttendanceRecord.session_id == session_id,
+                    AttendanceRecord.roll_no == roll_no,
+                )
+                .first()
+            )
+            if existing is not None:
+                return existing
+
+            record = AttendanceRecord(
+                session_id=session_id,
+                roll_no=roll_no,
+                confidence_score=confidence_score,
+                marked_at=marked_at or datetime.now(timezone.utc),
+                status=status,
+            )
+            db.add(record)
+            db.commit()
+            db.refresh(record)
+            return record
+
+    def bulk_add_attendance_records(
+        self,
+        session_id: str,
+        records: Sequence[Dict[str, object]],
+    ) -> List[AttendanceRecord]:
+        saved: List[AttendanceRecord] = []
+        for record in records:
+            saved.append(
+                self.add_attendance_record(
+                    session_id=session_id,
+                    roll_no=str(record["roll_no"]),
+                    confidence_score=float(record["confidence_score"]),
+                    status=str(record.get("status", "PRESENT")),
+                    marked_at=record.get("marked_at"),
+                )
+            )
+        return saved
+
+    def list_attendance_records(self, session_id: Optional[str] = None) -> List[AttendanceRecord]:
+        with SessionLocal() as db:
+            query = db.query(AttendanceRecord).order_by(AttendanceRecord.marked_at.desc())
+            if session_id:
+                query = query.filter(AttendanceRecord.session_id == session_id)
+            return query.all()
+
+    def get_session_statistics(self, session_id: str) -> Dict[str, object]:
+        with SessionLocal() as db:
+            session = db.get(AttendanceSession, session_id)
+            if session is None:
+                return {}
+
+            capture_count = (
+                db.query(func.count(AttendanceCapture.capture_id))
+                .filter(AttendanceCapture.session_id == session_id)
                 .scalar()
                 or 0
             )
-            db.commit()
-            db.refresh(session)
-            return session
+            record_count = (
+                db.query(func.count(AttendanceRecord.record_id))
+                .filter(AttendanceRecord.session_id == session_id)
+                .scalar()
+                or 0
+            )
+            present_count = (
+                db.query(func.count(AttendanceRecord.record_id))
+                .filter(
+                    AttendanceRecord.session_id == session_id,
+                    AttendanceRecord.status == "PRESENT",
+                )
+                .scalar()
+                or 0
+            )
+            manually_verified_count = (
+                db.query(func.count(AttendanceRecord.record_id))
+                .filter(
+                    AttendanceRecord.session_id == session_id,
+                    AttendanceRecord.status == "MANUALLY_VERIFIED",
+                )
+                .scalar()
+                or 0
+            )
+            absent_count = (
+                db.query(func.count(AttendanceRecord.record_id))
+                .filter(
+                    AttendanceRecord.session_id == session_id,
+                    AttendanceRecord.status == "ABSENT",
+                )
+                .scalar()
+                or 0
+            )
 
-    def get_session_statistics(self, session_id: str) -> Dict:
-        with SessionLocal() as db:
-            session = db.query(AttendanceSession).filter_by(session_id=session_id).first()
-            if session is None:
-                return {}
-            total = db.query(func.count(AttendanceCapture.id)).filter_by(
-                session_id=session_id
-            ).scalar() or 0
             return {
-                "session_id": session_id,
+                "session_id": session.session_id,
+                "prof_name": session.prof_name,
+                "course_name": session.course_name,
                 "status": session.status,
-                "total_captures": total,
-                "accepted": total,
-                "rejected": 0,
-                "acceptance_rate": 100.0 if total else 0.0,
-                "total_cycles": session.total_cycles_completed,
-                "total_students_collected": session.total_cycles_completed,
-                "session_start": session.session_start,
-                "session_end": session.session_end,
-                "duration_minutes": session.duration_minutes,
+                "start_time": session.start_time,
+                "end_time": session.end_time,
+                "expected_students": session.expected_students,
+                "captured_students": session.captured_students,
+                "capture_count": capture_count,
+                "record_count": record_count,
+                "present_count": present_count,
+                "manually_verified_count": manually_verified_count,
+                "absent_count": absent_count,
             }
 
-    def create_or_get_student(
-        self,
-        name: str,
-        roll_no: Optional[str] = None,
-        department: Optional[str] = None,
-        semester: Optional[str] = None,
-    ) -> Optional[Student]:
-        with SessionLocal() as db:
-            if roll_no:
-                student = db.query(Student).filter_by(roll_no=roll_no).first()
-                if student:
-                    return student
-            student = Student(
-                name=name,
-                roll_no=roll_no or f"GEN-{uuid.uuid4().hex[:8].upper()}",
-                department=department or "Unknown",
-                semester=semester or "Unknown",
-            )
-            db.add(student)
-            db.commit()
-            db.refresh(student)
-            return student
+    def get_student_image_urls(self, roll_no: str) -> List[str]:
+        images = self.list_student_images(roll_no)
+        return [
+            self.storage.get_public_url("student-images", image.image_path)
+            for image in images
+        ]
 
-    def create_collection_session(self, student_name: str, **kwargs) -> Optional[Dict]:
-        target_images = int(kwargs.pop("target_images", TARGET_IMAGES))
-        student = self.create_or_get_student(name=student_name, **kwargs)
-        if student is None:
-            return None
-        session = self.create_session(
-            user_name=student_name,
-            duration_minutes=max(1, target_images * 2),
-            student_id=student.id,
-            collection_type="dataset",
-        )
-        return {
-            "session_id": session.session_id,
-            "student_id": student.id,
-            "student_name": student.name,
-            "target_images": target_images,
-        }
+    def get_session_capture_urls(self, session_id: str) -> List[str]:
+        captures = self.list_session_captures(session_id)
+        return [
+            self.storage.get_public_url("attendance-sessions", capture.image_path)
+            for capture in captures
+        ]
+    
+    def update_session_loop_counter(self, session_id: str, loop_count: int) -> None:
+        """Directly updates the 'captured_students' database column to act as a counter."""
+        with SessionLocal() as db:
+            session_record = db.query(AttendanceSession).filter(
+                AttendanceSession.session_id == session_id
+            ).first()
+            
+            if session_record:
+                session_record.captured_students = loop_count
+                db.commit()
+
+    def delete_student_images(self, roll_no: str) -> int:
+        """
+        Deletes all reference images associated with a student from 
+        both Supabase storage buckets and database tracking tables cleanly.
+        """
+        deleted_count = 0
+        with SessionLocal() as db:
+            # 1. Fetch all matching metadata records for the student
+            existing_images = db.query(StudentImage).filter(StudentImage.roll_no == roll_no).all()
+            
+            if existing_images:
+                # Extract the file paths to compile a deletion batch array
+                file_paths_to_purge = [img.image_path for img in existing_images]
+                
+                try:
+                    # 2. Check how your StorageService references the Supabase Client
+                    if hasattr(self.storage, 'supabase'):
+                        self.storage.supabase.storage.from_("student-images").remove(file_paths_to_purge)
+                    elif hasattr(self.storage, 'client'):
+                        self.storage.client.storage.from_("student-images").remove(file_paths_to_purge)
+                    else:
+                        # Fallback direct call if your service wraps the removal internally
+                        logger.warning("Could not automatically locate the Supabase Client reference variable.")
+                except Exception as storage_err:
+                    logger.error(f"Supabase Storage Cloud Bucket API could not purge files: {storage_err}")
+
+                # 3. Remove tracking records from local database architecture 
+                for img in existing_images:
+                    try:
+                        db.delete(img)
+                        deleted_count += 1
+                    except Exception as db_err:
+                        logger.error(f"Failed to clear database metadata row {img.image_path}: {db_err}")
+                
+                db.commit()
+                
+        return deleted_count

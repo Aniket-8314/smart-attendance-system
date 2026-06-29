@@ -1,5 +1,3 @@
-"""Live attendance dataset collection using a fixed 20-slot capture grid."""
-
 import logging
 import os
 import sys
@@ -7,15 +5,14 @@ import time
 from datetime import datetime
 
 import cv2
+import numpy as np
 import streamlit as st
-from streamlit_webrtc import WebRtcMode, webrtc_streamer
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, ROOT_DIR)
 
-from backend.attendance_service import AttendanceService, TARGET_IMAGES
-from backend.capture_processor import AttendanceVideoProcessor
-from frontend.ui import apply_global_styles
+from backend.attendance_service import AttendanceService
+from frontend.ui import apply_global_styles, page_header, section_title
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,356 +20,235 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-st.set_page_config(page_title="Attendance Collection", page_icon=":camera:", layout="wide")
-apply_global_styles(max_width=1380)
+st.set_page_config(page_title="Attendance Session", page_icon=":camera:", layout="wide")
+apply_global_styles(max_width=1400)
 
-st.markdown(
-    """
-    <style>
-    .session-header {display:flex; justify-content:space-between; align-items:center;
-      padding: 1rem 1.25rem; border-radius: 8px; color:#172033;
-      background:#ffffff; border:1px solid #d9e2ec; margin-bottom:1rem;
-      box-shadow:0 1px 2px rgba(16,24,40,.04);}
-    .session-header h1 {font-size:1.7rem; margin:0;}
-    .countdown {font: 700 1.6rem monospace; color:#ffffff; background:#b42318;
-      padding:.35rem .75rem; border-radius:8px; position:sticky; top:.5rem; z-index:999;}
-    .placeholder {border: 2px dashed #bcccdc; border-radius: 8px; height: 140px;
-      display: flex; align-items: center; justify-content: center; color: #667085;
-      background:#ffffff;
-      font-size: 0.85rem; text-align: center;}
-    .face-count-live {font-size: 1.1rem; font-weight: 600; padding: 0.5rem 0;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-required = (
-    "current_session_id",
-    "current_instructor_name",
-    "session_duration_minutes",
-    "session_start_epoch",
-    "session_deadline_epoch",
-)
+# Verify Active Session Handshakes
+required = ("current_session_id", "current_prof_name", "current_course_name")
 if any(key not in st.session_state for key in required):
     st.error("No active attendance session was found.")
     if st.button("Start Attendance Session", type="primary"):
         st.switch_page("pages/start_attendance_session.py")
     st.stop()
 
-session_id = st.session_state.current_session_id
-deadline = st.session_state.session_deadline_epoch
-
-for key, value in {
-    "students_collected": 0,
-    "captured_images": [None] * TARGET_IMAGES,
-    "retake_slot": None,
-    "cooldown_until": None,
-    "save_success": None,
-    "session_finalized": False,
-    "pending_rerun": False,
-}.items():
-    st.session_state.setdefault(key, value)
-
-
+# Initialize face detector (Haar Cascade)
 @st.cache_resource
-def get_attendance_service() -> AttendanceService:
-    return AttendanceService()
+def load_face_detector():
+    return cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
+face_cascade = load_face_detector()
 
-def format_remaining(seconds: int) -> str:
-    seconds = max(0, seconds)
-    return f"{seconds // 60:02d}:{seconds % 60:02d}"
+service = AttendanceService()
+session_id = st.session_state.current_session_id
+session = service.get_session(session_id)
+if session is None:
+    st.error("Attendance session not found.")
+    st.stop()
 
+# Initialize Session States for 20 Classroom Frame Captures
+if "session_captured_images" not in st.session_state:
+    st.session_state["session_captured_images"] = [None] * 20
+if "session_is_capturing" not in st.session_state:
+    st.session_state["session_is_capturing"] = False
+if "session_retake_index" not in st.session_state:
+    st.session_state["session_retake_index"] = None
 
-def filled_count() -> int:
-    return sum(1 for item in st.session_state.captured_images if item is not None)
-
-
-def next_student_label() -> str:
-    return f"STD_{st.session_state.students_collected + 1:06d}"
-
-
-def get_next_slot() -> int:
-    if st.session_state.retake_slot is not None:
-        slot = st.session_state.retake_slot
-        st.session_state.retake_slot = None
-        return slot
-    return next(
-        (index for index, value in enumerate(st.session_state.captured_images) if value is None),
-        -1,
-    )
-
-
-def should_capture_images() -> bool:
-    return (
-        remaining > 0
-        and st.session_state.cooldown_until is None
-        and filled_count() < TARGET_IMAGES
-    )
-
-
-def drain_capture_queue(processor: AttendanceVideoProcessor) -> int:
-    """Main Streamlit thread: move queued captures into fixed session_state slots."""
-    if processor is None:
-        return 0
-
-    added = 0
-    while True:
-        payload = processor.pop_capture()
-        if payload is None:
-            break
-        slot = get_next_slot()
-        if slot == -1:
-            logger.info("All fixed slots full; dropping queued frame")
-            processor.clear_buffer()
-            processor.pause_capture()
-            break
-        st.session_state.captured_images[slot] = payload
-        added += 1
-        logger.info("Slot Updated: slot %s", slot + 1)
-
-    if filled_count() >= TARGET_IMAGES:
-        processor.clear_buffer()
-        processor.pause_capture()
-
-    if added:
-        logger.info(
-            "Session State Updated: added=%s, slots_filled=%s, queue_remaining=%s",
-            added,
-            filled_count(),
-            processor.snapshot()["queue_size"],
-        )
-        st.session_state.pending_rerun = True
-    return added
-
-
-def reset_capture_state(processor) -> None:
-    st.session_state.captured_images = [None] * TARGET_IMAGES
-    st.session_state.retake_slot = None
-    st.session_state.save_success = None
-    if processor:
-        processor.clear_buffer()
-        processor.resume_capture()
-
-
-def finalize_session(status: str = "completed") -> None:
-    if not st.session_state.session_finalized:
-        get_attendance_service().end_session(session_id, status=status)
-        st.session_state.session_finalized = True
-    st.switch_page("pages/attendance_completion.py")
-
-
-def default_snapshot() -> dict:
-    return {
-        "face_status": "Waiting for camera",
-        "face_count": 0,
-        "quality_message": "",
-        "camera_error": None,
-        "queue_size": 0,
-        "capture_count": 0,
-        "detector": {"initialized": False},
-    }
-
-
-def render_slot(index: int, processor) -> None:
-    entry = st.session_state.captured_images[index]
-    if entry is not None:
-        image_rgb = cv2.cvtColor(entry["image"], cv2.COLOR_BGR2RGB)
-        st.image(image_rgb, channels="RGB", caption="Captured Image", use_container_width=True)
-        if st.button("Retake", key=f"retake_{index}", use_container_width=True):
-            st.session_state.captured_images[index] = None
-            st.session_state.retake_slot = index
-            logger.info("Image Retaken: slot %s", index + 1)
-            if processor:
-                processor.clear_buffer()
-                processor.resume_capture()
-            st.rerun()
-    else:
-        st.markdown(
-            f"<div class='placeholder'>Slot {index + 1}<br>Waiting For Capture</div>",
-            unsafe_allow_html=True,
-        )
-
-
-remaining = max(0, int(deadline - time.time()))
-if remaining <= 0:
-    finalize_session()
-
-camera_should_run = should_capture_images()
-
-st.markdown(
-    f"""
-    <div class="session-header">
-      <h1>Attendance Collection</h1>
-      <div class="countdown">{format_remaining(remaining)}</div>
-    </div>
-    """,
-    unsafe_allow_html=True,
+page_header(
+    "Attendance Session",
+    "Course: {session.course_name} | Professor: {session.prof_name}",
 )
 
-camera_col, panel_col = st.columns([1.55, 1], gap="large")
+# Fetch Current System States
+stats = service.get_session_statistics(session_id)
+captures = service.list_session_captures(session_id)
+records = service.list_attendance_records(session_id)
+students = service.list_students()
 
-with camera_col:
-    st.subheader("Live Camera")
-    context = webrtc_streamer(
-        key=f"attendance-camera-{session_id}",
-        mode=WebRtcMode.SENDRECV,
-        desired_playing_state=camera_should_run,
-        media_stream_constraints={"video": True, "audio": False},
-        video_processor_factory=AttendanceVideoProcessor,
-        async_processing=True,
-        video_html_attrs={"autoPlay": True, "controls": False, "muted": True},
-    )
-    processor = context.video_processor
-    if processor:
-        processor.set_deadline(deadline)
-        if camera_should_run:
-            processor.resume_capture()
-        else:
-            processor.clear_buffer()
-            processor.pause_capture()
+section_title("Session Summary")
+summary_cols = st.columns(5)
+summary_cols[0].metric("Session ID", session.session_id[:12] + "...")
+summary_cols[1].metric("Status", session.status)
+summary_cols[2].metric("Captures", stats.get("capture_count", 0))
+summary_cols[3].metric("Attendance Records", stats.get("record_count", 0))
+summary_cols[4].metric("Captured Students", session.captured_students or 0)
 
-    if camera_should_run and not context.state.playing:
-        st.info("Allow browser camera permission. The camera starts automatically.")
+control_col, verify_col = st.columns([1, 1], gap="large")
 
-    if context.state.playing and processor:
-        drain_capture_queue(processor)
-
-active_processor = context.video_processor
-snapshot = active_processor.snapshot() if active_processor else default_snapshot()
-
-with panel_col:
-    st.subheader("Status Information")
-    st.markdown(
-        f"<p class='face-count-live'>Faces Detected: <strong>{snapshot.get('face_count', 0)}</strong></p>",
-        unsafe_allow_html=True,
-    )
-
-    if snapshot["camera_error"]:
-        st.error(f"Camera error: {snapshot['camera_error']}")
-    elif filled_count() >= TARGET_IMAGES:
-        st.success("20 images captured. Face detection is stopped until a retake is requested.")
-    elif snapshot["face_status"] == "Single Face Detected":
-        st.success(f"Single Face Detected - {snapshot['quality_message'] or 'Ready to capture'}")
-    elif snapshot["face_status"] == "Multiple Faces Detected":
-        st.error("Multiple Faces Detected")
-    elif snapshot["face_status"] == "Initializing Face Detector":
-        st.info("Camera connected. Initializing face detector...")
-    elif snapshot["face_status"] == "No Face Detected":
-        st.warning("No Face Detected")
-    else:
-        st.info(snapshot["face_status"])
-
-    row1 = st.columns(2)
-    row1[0].metric("Session ID", session_id[:12] + "...")
-    row1[1].metric("Instructor", st.session_state.current_instructor_name)
-    row2 = st.columns(2)
-    row2[0].metric("Students Collected", st.session_state.students_collected)
-    row2[1].metric("Remaining Time", format_remaining(remaining))
-    st.metric("Current Student ID", next_student_label())
-    st.metric("Captured Images", f"{filled_count()} / {TARGET_IMAGES}")
-    st.progress(filled_count() / TARGET_IMAGES)
-    st.caption(
-        f"Processor queue: {snapshot['queue_size']} - "
-        f"Total captures: {snapshot['capture_count']} - "
-        f"Quality: {snapshot['quality_message'] or 'n/a'}"
-    )
-
-logger.info("Rendering fixed grid with %s filled slots", filled_count())
-
-st.divider()
-st.subheader("Captured Images")
-
-for row_start in range(0, TARGET_IMAGES, 5):
-    columns = st.columns(5)
-    for column, index in zip(columns, range(row_start, row_start + 5)):
-        with column:
-            render_slot(index, context.video_processor)
-
-st.divider()
-
-with st.expander("Debug Tools", expanded=False):
-    if st.button("Capture Test Image", help="Bypass face detection to test fixed slot updates"):
-        test_processor = context.video_processor
-        if test_processor is None:
-            st.warning("Camera processor not ready.")
-        else:
-            payload = test_processor.capture_test_frame()
-            if payload is None:
-                st.warning("No camera frame available yet.")
-            else:
-                slot = get_next_slot()
-                if slot == -1:
-                    st.warning("All 20 slots are full.")
-                else:
-                    st.session_state.captured_images[slot] = payload
-                    logger.info("Slot Updated (test): slot %s", slot + 1)
-                    logger.info("Session State Updated (test): filled=%s", filled_count())
-                    st.success(f"Test image added to slot {slot + 1}")
-                    st.rerun()
-
-if st.session_state.save_success:
-    saved = st.session_state.save_success
-    st.success("Student Dataset Saved Successfully")
-    detail = st.columns(4)
-    detail[0].metric("Student ID", saved["student_id"])
-    detail[1].metric("Images Saved", saved["image_count"])
-    detail[2].metric("Session ID", saved["session_id"][:12] + "...")
-    detail[3].metric("Capture Time", saved["capture_time"])
-
-if st.session_state.cooldown_until is not None:
-
-    @st.fragment(run_every=0.25)
-    def cooldown() -> None:
-        seconds = max(0, int(st.session_state.cooldown_until - time.time() + 0.99))
-        if seconds > 0:
-            st.info(f"Preparing Next Student - {seconds}")
-        if time.time() >= deadline:
-            finalize_session()
-        if seconds <= 0:
-            st.session_state.cooldown_until = None
-            reset_capture_state(context.video_processor)
+with control_col:
+    section_title("Capture Classroom Reference Grid")
+    
+    col_btn1, col_btn2 = st.columns(2)
+    with col_btn1:
+        if st.button("Start Automated Capture Loop", type="primary", use_container_width=True):
+            st.session_state["session_is_capturing"] = True
+            st.session_state["session_retake_index"] = None
+    with col_btn2:
+        if st.button("Clear Reference Grid", use_container_width=True):
+            st.session_state["session_captured_images"] = [None] * 20
+            st.session_state["session_is_capturing"] = False
+            st.session_state["session_retake_index"] = None
             st.rerun()
 
-    cooldown()
-else:
-    if st.button("Keep All Images", type="primary", use_container_width=True):
-        count = filled_count()
-        if count < TARGET_IMAGES:
-            st.error(f"{TARGET_IMAGES} images required before saving. Currently captured: {count}.")
+    # Camera Capture Framework Loop
+    if st.session_state["session_is_capturing"] or st.session_state["session_retake_index"] is not None:
+        camera_placeholder = st.empty()
+        status_placeholder = st.empty()
+        
+        cap = cv2.VideoCapture(0)
+        
+        if not cap.isOpened():
+            st.error("Error: Could not access web camera components.")
+            st.session_state["session_is_capturing"] = False
+            st.session_state["session_retake_index"] = None
         else:
+            last_capture_time = time.time()
+            
+            if st.session_state["session_retake_index"] is not None:
+                target_indices = [st.session_state["session_retake_index"]]
+                status_placeholder.warning(f"Retaking Sample Frame #{st.session_state['session_retake_index'] + 1}...")
+            else:
+                target_indices = [i for i, img in enumerate(st.session_state["session_captured_images"]) if img is None]
+            
+            target_idx_iter = iter(target_indices)
             try:
-                frames = [entry["image"] for entry in st.session_state.captured_images]
-                capture_times = [entry["capture_time"] for entry in st.session_state.captured_images]
-                student_id, _ = get_attendance_service().save_student_dataset(
+                current_target = next(target_idx_iter)
+            except StopIteration:
+                current_target = None
+                
+            while cap.isOpened() and current_target is not None:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                    
+                frame = cv2.flip(frame, 1)
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80))
+                
+                preview_frame = frame.copy()
+                for (x, y, w, h) in faces:
+                    cv2.rectangle(preview_frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                    
+                camera_placeholder.image(cv2.cvtColor(preview_frame, cv2.COLOR_BGR2RGB), channels="RGB", use_container_width=True)
+                
+                num_faces = len(faces)
+                current_time = time.time()
+                
+                # Validation requirement matching previous rules
+                if num_faces == 1:
+                    status_placeholder.success(f"Target locked! Storing reference sequence for Slot #{current_target + 1}...")
+                    if current_time - last_capture_time >= 1.0:
+                        _, buffer = cv2.imencode('.jpg', frame)
+                        img_bytes = buffer.tobytes()
+                        
+                        st.session_state["session_captured_images"][current_target] = img_bytes
+                        last_capture_time = current_time
+                        
+                        try:
+                            current_target = next(target_idx_iter)
+                        except StopIteration:
+                            current_target = None
+                elif num_faces == 0:
+                    status_placeholder.error("No face detected inside tracking metrics. Adjust focus.")
+                else:
+                    status_placeholder.warning(f"Multiple tracking profiles detected ({num_faces}). Keep view clean.")
+                    
+                time.sleep(0.03)
+                
+            cap.release()
+            camera_placeholder.empty()
+            status_placeholder.empty()
+            st.session_state["session_is_capturing"] = False
+            st.session_state["session_retake_index"] = None
+            st.rerun()
+
+    if st.button("Close Active Session", use_container_width=True):
+        service.close_session(session_id)
+        st.session_state.session_finalized = True
+        st.switch_page("pages/attendance_completion.py")
+
+with verify_col:
+    section_title("Manual Attendance Marking")
+    if students:
+        with st.form("attendance_record_form", clear_on_submit=True):
+            student_label = st.selectbox(
+                "Student",
+                [f"{student.roll_no} - {student.name}" for student in students],
+            )
+            confidence_score = st.slider("Confidence Score", 0.0, 1.0, 0.95, 0.01)
+            status_val = st.selectbox(
+                "Status",
+                ["PRESENT", "ABSENT", "MANUALLY_VERIFIED"],
+            )
+            submit_record = st.form_submit_button("Save Attendance Record", use_container_width=True)
+            
+        if submit_record:
+            roll_no = student_label.split(" - ", 1)[0]
+            try:
+                record = service.add_attendance_record(
                     session_id=session_id,
-                    frames=frames,
-                    capture_times=capture_times,
+                    roll_no=roll_no,
+                    confidence_score=float(confidence_score),
+                    status=status_val,
+                    marked_at=datetime.now().astimezone(),
                 )
-                st.session_state.students_collected += 1
-                st.session_state.save_success = {
-                    "student_id": student_id,
-                    "image_count": TARGET_IMAGES,
-                    "session_id": session_id,
-                    "capture_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                }
-                st.session_state.cooldown_until = time.time() + 2
-                if context.video_processor:
-                    context.video_processor.pause_capture()
+                st.success(f"Recorded {record.roll_no} as {record.status}.")
                 st.rerun()
             except Exception as exc:
-                logger.exception("Save workflow failed")
-                st.error(f"Could not save student dataset: {exc}")
+                st.error(f"Could not save attendance record: {exc}")
+    else:
+        st.info("Register students before marking attendance.")
 
-st.divider()
-if st.button("End Session Early", use_container_width=True):
-    if context.video_processor:
-        context.video_processor.pause_capture()
-    finalize_session(status="completed")
+# 20 Image Display Grid Interface matching structural criteria
+section_title("Live Preview Reference Grid (20 Collected Frames)")
+grid_cols = st.columns(4)
 
-if st.session_state.pending_rerun:
-    st.session_state.pending_rerun = False
-    st.rerun()
-elif camera_should_run and context.state.playing and st.session_state.cooldown_until is None:
-    time.sleep(0.5)
-    st.rerun()
+for index in range(20):
+    with grid_cols[index % 4]:
+        st.markdown(f"**Sequence Slot #{index + 1}**")
+        img_data = st.session_state["session_captured_images"][index]
+        
+        if img_data is not None:
+            st.image(img_data, use_container_width=True)
+            if st.button(f"Retake Frame #{index + 1}", key=f"session_retake_btn_{index}", use_container_width=True):
+                st.session_state["session_retake_index"] = index
+                st.rerun()
+        else:
+            st.info("Awaiting Capture")
+
+# Keep All Button Trigger Logic at the very end
+all_captured = all(img is not None for img in st.session_state["session_captured_images"])
+
+if all_captured:
+    st.write("---")
+    if st.button("Keep All & Save Captures to DB", type="primary", use_container_width=True):
+        saved_count = 0
+        progress_bar = st.progress(0)
+        try:
+            # 1. Save all 20 individual image assets into your Capture backend table
+            for index, img_bytes in enumerate(st.session_state["session_captured_images"]):
+                capture = service.add_capture(
+                    session_id=session_id,
+                    image_bytes=img_bytes,
+                    capture_time=datetime.now().astimezone(),
+                )
+                saved_count += 1
+                progress_bar.progress(saved_count / 20)
+            
+            # 2. Increment the loop counter based on current session snapshot values
+            current_loops = session.captured_students or 0
+            new_loop_count = current_loops + 1
+            
+            # 3. Commit the structural count increment straight to the Database metadata
+            try:
+                service.update_session_loop_counter(session_id=session_id, loop_count=new_loop_count)
+                st.success(f"Successfully finalized and posted camera execution batch #{new_loop_count} (20 frames)!")
+            except AttributeError:
+                # Direct fallback alert if backend initialization is pending
+                st.warning("Captured image arrays saved, but backend 'update_session_loop_counter' method needs declaration.")
+            
+            # 4. Flush grid state buffers clean for the next tracking loop iteration
+            st.session_state["session_captured_images"] = [None] * 20
+            st.rerun()
+            
+        except Exception as exc:
+            st.error(f"Error persisting session frames to database: {exc}")

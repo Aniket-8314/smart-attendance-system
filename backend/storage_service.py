@@ -1,122 +1,90 @@
-"""Filesystem storage for approved attendance student datasets."""
+"""Supabase Storage helpers for attendance and student reference images."""
+
+from __future__ import annotations
 
 import logging
-import os
-import shutil
 import uuid
-from datetime import datetime
-from pathlib import Path
-from typing import List, Sequence, Tuple
+from pathlib import PurePosixPath
+from typing import Optional, Sequence
 
-import cv2
-import numpy as np
+from database.db import ATTENDANCE_SESSIONS_BUCKET, STUDENT_IMAGES_BUCKET, supabase
 
 logger = logging.getLogger(__name__)
 
 
 class StorageService:
-    def __init__(self, base_path: str = None):
-        project_root = Path(__file__).resolve().parent.parent
-        self.base_path = Path(base_path or project_root / "attendance_dataset")
-        self.base_path.mkdir(parents=True, exist_ok=True)
+    def __init__(self, client=None):
+        self.client = client or supabase
+        if self.client is None:
+            raise RuntimeError("SUPABASE_URL and SUPABASE_KEY are required for storage operations")
 
-    def get_session_directory(self, session_id: str) -> Path:
-        path = self.base_path / session_id
-        path.mkdir(parents=True, exist_ok=True)
+    @staticmethod
+    def _normalize_segment(value: str) -> str:
+        return "".join(character if character.isalnum() or character in {"-", "_"} else "_" for character in value.strip())
+
+    @staticmethod
+    def _filename(extension: str = "jpg", prefix: str = "image") -> str:
+        return f"{prefix}_{uuid.uuid4().hex}.{extension.lstrip('.')}"
+
+    def student_image_path(self, roll_no: str, filename: Optional[str] = None) -> str:
+        safe_roll = self._normalize_segment(roll_no)
+        safe_filename = PurePosixPath(filename).name if filename else self._filename()
+        return str(PurePosixPath(safe_roll) / safe_filename)
+
+    def attendance_capture_path(self, session_id: str, filename: Optional[str] = None) -> str:
+        safe_session = self._normalize_segment(session_id)
+        safe_filename = PurePosixPath(filename).name if filename else self._filename(prefix="capture")
+        return str(PurePosixPath(safe_session) / safe_filename)
+
+    def upload_student_image(self, roll_no: str, image_bytes: bytes, content_type: str = "image/jpeg", filename: Optional[str] = None) -> str:
+        path = self.student_image_path(roll_no, filename)
+        self.client.storage.from_(STUDENT_IMAGES_BUCKET).upload(
+            path,
+            image_bytes,
+            file_options={"content-type": content_type},
+        )
+        logger.info("Uploaded student image: %s/%s", STUDENT_IMAGES_BUCKET, path)
         return path
 
-    def get_student_directory(self, session_id: str, student_id: str) -> Path:
-        return self.get_session_directory(session_id) / student_id
+    def upload_attendance_capture(self, session_id: str, image_bytes: bytes, content_type: str = "image/jpeg", filename: Optional[str] = None) -> str:
+        path = self.attendance_capture_path(session_id, filename)
+        self.client.storage.from_(ATTENDANCE_SESSIONS_BUCKET).upload(
+            path,
+            image_bytes,
+            file_options={"content-type": content_type},
+        )
+        logger.info("Uploaded attendance capture: %s/%s", ATTENDANCE_SESSIONS_BUCKET, path)
+        return path
 
-    def save_student_images(
-        self,
-        frames: Sequence[np.ndarray],
-        session_id: str,
-        student_id: str,
-    ) -> List[Tuple[str, int, int]]:
-        """Write attendance_dataset/session_id/student_id/image_NNN.jpg."""
-        if not frames:
-            raise ValueError("Cannot save an empty student dataset")
+    def delete_student_images(self, roll_no: str, image_paths: Optional[Sequence[str]] = None) -> int:
+        """
+        Delete every stored reference image for a student.
 
-        final_dir = self.get_student_directory(session_id, student_id)
-        if final_dir.exists():
-            raise FileExistsError(f"Student dataset already exists: {final_dir}")
+        The database is the source of truth for known files, but we also sweep the
+        student's storage folder so orphaned objects from earlier failed updates are
+        removed too.
+        """
+        bucket = self.client.storage.from_(STUDENT_IMAGES_BUCKET)
+        safe_roll = self._normalize_segment(roll_no)
 
-        temp_dir = final_dir.with_name(f".{student_id}-{uuid.uuid4().hex}.tmp")
-        temp_dir.mkdir(parents=True, exist_ok=False)
-        saved: List[Tuple[str, int, int]] = []
+        paths_to_delete = {str(PurePosixPath(path)) for path in (image_paths or []) if path}
 
         try:
-            for sequence, frame in enumerate(frames, start=1):
-                filename = f"image_{sequence:03d}.jpg"
-                path = temp_dir / filename
-                if not cv2.imwrite(str(path), frame, [cv2.IMWRITE_JPEG_QUALITY, 92]):
-                    raise OSError(f"Failed to write {path}")
-                height, width = frame.shape[:2]
-                relative = Path(session_id) / student_id / filename
-                saved.append((str(relative), width, height))
+            folder_entries = bucket.list(safe_roll)
+            for entry in folder_entries or []:
+                filename = entry.get("name") if isinstance(entry, dict) else None
+                if filename:
+                    paths_to_delete.add(str(PurePosixPath(safe_roll) / filename))
+        except Exception as exc:
+            logger.warning("Could not list student image folder %s: %s", safe_roll, exc)
 
-            temp_dir.replace(final_dir)
-            logger.info("Images Saved: %s/%s", session_id, student_id)
-            return saved
-        except Exception:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            logger.exception("Storage failure for %s/%s", session_id, student_id)
-            raise
+        if not paths_to_delete:
+            logger.info("No student images found for %s", roll_no)
+            return 0
 
-    def get_cycle_directory(self, session_id: str, cycle_id: str) -> Path:
-        """Backward-compatible alias for student directory."""
-        return self.get_student_directory(session_id, cycle_id)
+        bucket.remove(sorted(paths_to_delete))
+        logger.info("Deleted %d student images from %s/%s", len(paths_to_delete), STUDENT_IMAGES_BUCKET, safe_roll)
+        return len(paths_to_delete)
 
-    def save_cycle_images(
-        self,
-        frames: Sequence[np.ndarray],
-        session_id: str,
-        cycle_id: str,
-    ) -> List[Tuple[str, int, int]]:
-        return self.save_student_images(frames, session_id, cycle_id)
-
-    def save_capture_image(
-        self,
-        frame: np.ndarray,
-        session_id: str,
-        capture_number: int,
-    ) -> Tuple[str, int, int]:
-        """Compatibility path for the existing single-image dataset page."""
-        session_dir = self.get_session_directory(session_id)
-        filename = (
-            f"capture_{capture_number:03d}_"
-            f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
-        )
-        path = session_dir / filename
-        if not cv2.imwrite(str(path), frame, [cv2.IMWRITE_JPEG_QUALITY, 92]):
-            raise OSError(f"Failed to write {path}")
-        height, width = frame.shape[:2]
-        return str(Path(session_id) / filename), width, height
-
-    def delete_student_dataset(self, session_id: str, student_id: str) -> None:
-        shutil.rmtree(
-            self.get_student_directory(session_id, student_id),
-            ignore_errors=True,
-        )
-
-    def delete_cycle(self, session_id: str, cycle_id: str) -> None:
-        self.delete_student_dataset(session_id, cycle_id)
-
-    def get_session_images(self, session_id: str) -> List[str]:
-        session_dir = self.get_session_directory(session_id)
-        return sorted(
-            str(path)
-            for path in session_dir.rglob("*.jpg")
-            if path.is_file()
-        )
-
-    def resolve_path(self, relative_path: str) -> str:
-        return str(self.base_path / relative_path)
-
-    def delete_session_directory(self, session_id: str) -> bool:
-        session_dir = self.base_path / session_id
-        if not session_dir.exists():
-            return False
-        shutil.rmtree(session_dir)
-        return True
+    def get_public_url(self, bucket: str, path: str) -> str:
+        return self.client.storage.from_(bucket).get_public_url(path)

@@ -32,60 +32,80 @@ service = AttendanceService()
 session_id = st.session_state.current_session_id
 session = service.get_session(session_id)
 stats = service.get_session_statistics(session_id)
-captures = service.get_session_captures(session_id)
+captures = service.list_session_captures(session_id)
+records = service.list_attendance_records(session_id)
 
 if session is None:
     st.error("Session not found in the database.")
     st.stop()
 
-students_collected = stats.get("total_students_collected", 0)
-total_images = stats.get("total_captures", 0)
-
 page_header(
     "Attendance Session Complete",
-    "Review the session totals and download the capture report for records or analysis.",
+    "Review the session totals and download the capture/attendance report.",
 )
 
-first = st.columns(4)
-first[0].metric("Instructor Name", session.user_name)
-first[1].metric("Session ID", session_id[:12] + "...")
-first[2].metric("Students Collected", students_collected)
-first[3].metric("Total Images", total_images)
+first = st.columns(5)
+first[0].metric("Professor", session.prof_name)
+first[1].metric("Course", session.course_name)
+first[2].metric("Session ID", session.session_id[:12] + "...")
+first[3].metric("Captures", stats.get("capture_count", 0))
+first[4].metric("Attendance Records", stats.get("record_count", 0))
 
 second = st.columns(4)
 second[0].metric(
     "Start Time",
-    session.session_start.strftime("%Y-%m-%d %H:%M:%S") if session.session_start else "N/A",
+    session.start_time.strftime("%Y-%m-%d %H:%M:%S") if session.start_time else "N/A",
 )
 second[1].metric(
     "End Time",
-    session.session_end.strftime("%Y-%m-%d %H:%M:%S") if session.session_end else "N/A",
+    session.end_time.strftime("%Y-%m-%d %H:%M:%S") if session.end_time else "N/A",
 )
-second[2].metric("Duration", f"{session.duration_minutes} minutes")
-second[3].metric("Images Per Student", "20" if students_collected else "0")
+second[2].metric("Expected Students", session.expected_students or 0)
+second[3].metric("Captured Students", session.captured_students or 0)
+
+section_title("Attendance Records")
+if records:
+    st.dataframe(
+        [
+            {
+                "record_id": record.record_id,
+                "session_id": record.session_id,
+                "roll_no": record.roll_no,
+                "confidence_score": record.confidence_score,
+                "marked_at": record.marked_at,
+                "status": record.status,
+            }
+            for record in records
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+else:
+    st.info("No attendance records were saved for this session.")
 
 report = io.StringIO()
 writer = csv.writer(report)
-writer.writerow([
-    "session_id", "student_id", "instructor_name", "capture_timestamp",
-    "image_path", "image_width", "image_height", "face_count",
-    "verification_status", "capture_number", "device_info", "created_at",
-])
+writer.writerow(
+    [
+        "session_id",
+        "prof_name",
+        "course_name",
+        "capture_id",
+        "capture_time",
+        "image_path",
+    ]
+)
 for capture in captures:
-    writer.writerow([
-        session_id,
-        capture.cycle_id,
-        session.user_name,
-        capture.capture_time.isoformat() if capture.capture_time else "",
-        capture.image_path,
-        capture.image_width,
-        capture.image_height,
-        capture.face_count,
-        capture.verification_status,
-        capture.capture_number,
-        capture.device_info,
-        capture.created_at.isoformat() if capture.created_at else "",
-    ])
+    writer.writerow(
+        [
+            session.session_id,
+            session.prof_name,
+            session.course_name,
+            capture.capture_id,
+            capture.capture_time.isoformat() if capture.capture_time else "",
+            capture.image_path,
+        ]
+    )
 
 
 def clear_session() -> None:
@@ -93,13 +113,7 @@ def clear_session() -> None:
         key for key in st.session_state
         if key.startswith("current_")
         or key.startswith("session_")
-        or key in {
-            "students_collected",
-            "captured_images",
-            "retake_slot",
-            "cooldown_until",
-            "save_success",
-        }
+        or key in {"captured_images", "pending_attendance"}
     ]
     for key in keys:
         del st.session_state[key]
@@ -114,7 +128,7 @@ if new_col.button("Start New Session", type="primary", use_container_width=True)
     clear_session()
     st.switch_page("pages/start_attendance_session.py")
 report_col.download_button(
-    "Download Session Report",
+    "Download Capture Report",
     data=report.getvalue(),
     file_name=f"attendance_{session_id}.csv",
     mime="text/csv",
